@@ -1,24 +1,36 @@
-import sys
-import time
-from collections import defaultdict
-import networkx as nx
+import argparse
 import re
 import sys
 import time
-from functools import lru_cache
 from pathlib import Path
 
+# Đảm bảo in ký tự tiếng Việt trên Windows console không bị lỗi mã hóa cp1252
+if hasattr(sys.stdout, "reconfigure"):
+    sys.stdout.reconfigure(encoding="utf-8")
+if hasattr(sys.stderr, "reconfigure"):
+    sys.stderr.reconfigure(encoding="utf-8")
+
+# pyrefly: ignore [missing-import]
 import matplotlib.pyplot as plt
+# pyrefly: ignore [missing-import]
 from matplotlib.patches import FancyBboxPatch
+# pyrefly: ignore [missing-import]
 from matplotlib.widgets import Button
+
+from countdown_env import CountdownEnv
+from rl_agent import solve_countdown_rl
+from tree_visualizer import SearchTreeRecorder
 
 
 INPUT_FILE = Path(__file__).with_name("input.txt")
 OUTPUT_FILE = Path(__file__).with_name("ketqua.txt")
+TREE_DOT_FILE = Path(__file__).with_name("tree.dot")
+TREE_PNG_FILE = Path(__file__).with_name("tree.png")
 OPERATOR_SYMBOLS = {"+": "+", "-": "−", "*": "×", "/": "÷"}
 
 
 def read_problem(path):
+    """Đọc các số đầu vào và giá trị Target từ file input.txt."""
     content = path.read_text(encoding="utf-8")
     target_match = re.search(r"\bTarget\s*:\s*(\d+)\b", content, re.IGNORECASE)
     if target_match is None:
@@ -33,47 +45,29 @@ def read_problem(path):
     return numbers, target
 
 
-def countdown(numbers, target):
-    @lru_cache(maxsize=None)
-    def search(state):
-        if len(state) == 1:
-            return () if state[0] == target else None
+def countdown_rl(numbers, target, recorder=None, algorithm="mcts", require_use_all=True):
+    """
+    Giải bài toán Countdown bằng thuật toán Học tăng cường (Reinforcement Learning).
+    - algorithm: 'mcts' (Monte Carlo Tree Search + UCB1) hoặc 'qlearning' (Q-Learning TD).
+    - require_use_all: bắt buộc dùng tất cả các số ban đầu (đúng luật Countdown chuẩn).
+    """
+    return solve_countdown_rl(
+        numbers=numbers,
+        target=target,
+        recorder=recorder,
+        algorithm=algorithm,
+        require_use_all=require_use_all,
+    )
 
-        for first_index in range(len(state)):
-            for second_index in range(first_index + 1, len(state)):
-                first, second = state[first_index], state[second_index]
-                remaining = [
-                    value for index, value in enumerate(state)
-                    if index not in (first_index, second_index)
-                ]
-                candidates = [
-                    (first, "+", second, first + second),
-                    (first, "*", second, first * second),
-                ]
-                if first > second:
-                    candidates.append((first, "-", second, first - second))
-                elif second > first:
-                    candidates.append((second, "-", first, second - first))
-                if first % second == 0:
-                    candidates.append((first, "/", second, first // second))
-                if second % first == 0:
-                    candidates.append((second, "/", first, second // first))
 
-                tried_results = set()
-                for left, operator, right, result in candidates:
-                    if result <= 0 or result in tried_results:
-                        continue
-                    tried_results.add(result)
-                    next_state = tuple(sorted((*remaining, result)))
-                    later_steps = search(next_state)
-                    if later_steps is not None:
-                        return ((left, operator, right, result),) + later_steps
-        return None
-
-    return search(tuple(sorted(numbers)))
+# Giữ alias hàm cũ để tương thích
+def countdown(numbers, target, recorder=None):
+    operations, _ = countdown_rl(numbers, target, recorder=recorder, algorithm="mcts")
+    return operations
 
 
 def build_steps(numbers, operations):
+    """Dựng các bước tính toán và biểu thức toán học cuối cùng từ chuỗi hành động RL."""
     values = [(number, str(number)) for number in numbers]
     steps = []
     for left, operator, right, result in operations:
@@ -101,11 +95,20 @@ def build_steps(numbers, operations):
     return steps, values[0][1] if values else None
 
 
-def save_results(numbers, target, steps, expression, elapsed):
+def save_results(numbers, target, steps, expression, elapsed, stats=None):
+    """Lưu kết quả chạy và thông tin thuật toán RL vào file ketqua.txt."""
     with OUTPUT_FILE.open("w", encoding="utf-8") as output:
-        output.write("=== COUNTDOWN ===\n")
+        output.write("=== COUNTDOWN — REINFORCEMENT LEARNING ===\n")
         output.write(f"Các số: {' '.join(map(str, numbers))}\n")
         output.write(f"Target: {target}\n")
+        if stats:
+            output.write(f"Thuật toán: {stats.get('algorithm', 'RL')}\n")
+            if "simulations" in stats:
+                output.write(f"Số lượt mô phỏng (Simulations): {stats['simulations']}\n")
+            if "episodes_trained" in stats:
+                output.write(f"Số Episodes huấn luyện: {stats['episodes_trained']}\n")
+            if "root_visits" in stats:
+                output.write(f"Root Visits: {stats['root_visits']} | Root Q-Value: {stats.get('root_q_value', 0):.2f}\n")
         if expression is None:
             output.write("Không tìm thấy lời giải chính xác.\n")
         else:
@@ -120,6 +123,7 @@ def save_results(numbers, target, steps, expression, elapsed):
 
 
 def show_simulation(numbers, target, steps, expression):
+    """Giao diện đồ họa hiển thị từng bước giải mô phỏng tương tác bằng matplotlib."""
     figure, axis = plt.subplots(figsize=(11, 7))
     figure.patch.set_facecolor("#f3f4ef")
     axis.set_facecolor("#f3f4ef")
@@ -132,7 +136,7 @@ def show_simulation(numbers, target, steps, expression):
         axis.set_xlim(0, 1)
         axis.set_ylim(0, 1)
         axis.axis("off")
-        axis.text(0.06, 0.94, "COUNTDOWN", fontsize=23, weight="bold", color="#17324d")
+        axis.text(0.06, 0.94, "COUNTDOWN (RL SOLVER)", fontsize=22, weight="bold", color="#17324d")
         axis.text(0.94, 0.945, f"TARGET  {target}", ha="right", fontsize=15,
                   weight="bold", color="#c65d3a")
         axis.text(0.06, 0.875, f"SỐ BAN ĐẦU   {'  ·  '.join(map(str, numbers))}",
@@ -180,7 +184,7 @@ def show_simulation(numbers, target, steps, expression):
             axis.text(0.5, 0.41, equation, ha="center", va="center", fontsize=25,
                       weight="bold", color="#176b63")
             axis.text(0.06, 0.29, "CÒN LẠI SAU BƯỚC NÀY", fontsize=10,
-                      weight="bold", color="#52616b")
+                  weight="bold", color="#52616b")
             after_values = operation["after"]
             result_width = min(0.13, 0.78 / max(len(after_values), 1))
             result_gap = 0.018
@@ -226,31 +230,85 @@ def show_simulation(numbers, target, steps, expression):
 
 
 def main():
+    parser = argparse.ArgumentParser(description="Countdown Solver sử dụng Học tăng cường (Reinforcement Learning).")
+    parser.add_argument(
+        "--algo",
+        choices=["mcts", "qlearning"],
+        default="mcts",
+        help="Thuật toán RL sử dụng: 'mcts' (MCTS + UCB1, mặc định) hoặc 'qlearning' (Q-Learning TD).",
+    )
+    parser.add_argument(
+        "--no-gui",
+        action="store_true",
+        help="Chạy không mở cửa sổ giao diện Matplotlib (thích hợp chạy script tự động/headless).",
+    )
+    parser.add_argument(
+        "--allow-partial",
+        action="store_true",
+        help="Cho phép dừng ngay khi đạt target mà không cần dùng hết toàn bộ số đầu vào.",
+    )
+    args = parser.parse_args()
+
     try:
         numbers, target = read_problem(INPUT_FILE)
     except (OSError, ValueError) as error:
         print(f"Lỗi input: {error}")
         sys.exit(1)
 
+    algo_name = "MCTS" if args.algo == "mcts" else "Q-Learning"
+    tree_recorder = SearchTreeRecorder(target, algorithm=f"RL ({algo_name})")
+
+    print("=" * 60)
+    print(f"   COUNTDOWN SOLVER — REINFORCEMENT LEARNING ({algo_name.upper()})")
+    print("=" * 60)
+    print(f"Các số ban đầu: {numbers}")
+    print(f"Mục tiêu Target: {target}")
+    print(f"Bắt buộc dùng hết số: {not args.allow_partial}")
+    print("Đang chạy thuật toán Học tăng cường...")
+
     start_time = time.perf_counter()
-    operations = countdown(numbers, target)
+    operations, stats = countdown_rl(
+        numbers=numbers,
+        target=target,
+        recorder=tree_recorder,
+        algorithm=args.algo,
+        require_use_all=not args.allow_partial,
+    )
     elapsed = time.perf_counter() - start_time
     steps, expression = build_steps(numbers, operations) if operations is not None else ([], None)
 
-    print(f"Các số: {numbers} | Target: {target}")
+    dot_path = tree_recorder.write_dot(TREE_DOT_FILE)
+    tree_recorder.render_png(dot_path, TREE_PNG_FILE)
+
+    print("\n--- KẾT QUẢ HUẤN LUYỆN / TÌM KIẾM RL ---")
+    print(f"Thuật toán: {stats.get('algorithm', algo_name)}")
+    if "simulations" in stats:
+        print(f"Số lượt mô phỏng (Simulations): {stats['simulations']}")
+    if "episodes_trained" in stats:
+        print(f"Số Episodes huấn luyện: {stats['episodes_trained']}")
+    if "root_visits" in stats:
+        print(f"Root Visits: {stats['root_visits']} | Root Q-Value: {stats.get('root_q_value', 0):.2f}")
+    print(f"Số node cây RL (depth 0-2): {len(tree_recorder.nodes)}")
+    print(f"Số cạnh cây RL (depth 0-2): {len(tree_recorder.edges)}")
+    print(f"Thời gian tìm kiếm: {elapsed * 1000:.3f} ms")
+
+    print("\n--- LỜI GIẢI ---")
     if expression is None:
         print("Không tìm thấy lời giải chính xác.")
     else:
-        print(f"Lời giải: {expression} = {target}")
+        print(f"Biểu thức: {expression} = {target}")
         for index, step in enumerate(steps, start=1):
             print(
                 f"Bước {index}: {step['left']} {OPERATOR_SYMBOLS[step['operator']]} "
                 f"{step['right']} = {step['result']}"
             )
-    print(f"Thời gian tìm kiếm: {elapsed * 1000:.3f} ms")
-    save_results(numbers, target, steps, expression, elapsed)
-    print(f"Đã lưu kết quả vào: {OUTPUT_FILE}")
-    show_simulation(numbers, target, steps, expression)
+
+    save_results(numbers, target, steps, expression, elapsed, stats=stats)
+    print(f"\nĐã lưu kết quả vào: {OUTPUT_FILE}")
+    print(f"Đã tạo cây tìm kiếm RL: {dot_path}")
+
+    if not args.no_gui:
+        show_simulation(numbers, target, steps, expression)
 
 
 if __name__ == "__main__":
