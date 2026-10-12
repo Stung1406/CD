@@ -1,27 +1,25 @@
 """
 grpo_agent.py — Thuật toán GRPO (Group Relative Policy Optimization) cho Countdown.
 
-PHƯƠNG PHÁP RL THỨ BA của dự án, song song với MCTS+PUCT và Q-Learning.
-Hai thuật toán cũ trong `rl_agent.py` và môi trường `countdown_env.py` KHÔNG bị
-sửa đổi; GRPO tái sử dụng trực tiếp MDP hiện có.
+Thuật toán policy-gradient được dùng trong các chế độ train, eval và solve của
+dự án. GRPO sử dụng môi trường Countdown và có pipeline dữ liệu riêng.
 
 Tái sử dụng MDP từ `countdown_env.CountdownEnv`:
 - STATE   : tuple các số còn lại (sắp xếp tăng dần). Target KHÔNG nằm trong tuple
             nên chính sách được định nghĩa là π(a | s, target) — cả state lẫn
-            target đều được đưa vào mạng policy (tính Markov đầy đủ). Không đổi
-            cấu trúc State của dự án để Q-Learning / MCTS / visualization còn chạy.
+            target đều được đưa vào mạng policy (tính Markov đầy đủ).
 - ACTION  : định dạng chuẩn dự án (left, op, right, result[, next_state]).
             Số hành động hợp lệ THAY ĐỔI theo trạng thái, vì vậy policy là mô
             hình CHẤM ĐIỂM TỪNG CẶP (state, action) + action masking (softmax chỉ
             trên danh sách hành động hợp lệ), không dùng đầu ra cố định.
 - P       : môi trường xác định, P(s'|s,a) = 1; dùng lại CountdownEnv.step_state.
             GRPO không làm thay đổi transition.
-- R       : TÁCH BẠCH — env reward theo bước (giữ nguyên cho MCTS/Q-Learning)
-            và trajectory reward R(τ) cho GRPO tính từ VERIFIER ĐỘC LẬP:
+- R       : TÁCH BẠCH — env reward theo bước và trajectory reward R(τ) cho GRPO
+            tính từ VERIFIER ĐỘC LẬP:
             +1.0 thành công đã kiểm chứng; -1.0 hành động không hợp lệ;
             còn lại -0.5 + 0.5·credit với credit = 1 - min_error/target.
-- GAMMA   : GRPO KHÔNG dùng gamma của Q-Learning. Advantage tính trên reward
-            episode-level của cả trajectory (group-relative), không discounted.
+- GAMMA   : GRPO không dùng gamma. Advantage tính trên reward episode-level của
+            cả trajectory (group-relative), không discounted.
 
 OBJECTIVE (action-level; mỗi bước t trong trajectory xem như một "token"):
     ρ_t   = π_θ(a_t | s_t, target) / π_old(a_t | s_t, target)   (importance ratio)
@@ -53,7 +51,6 @@ import torch.nn.functional as F
 from torch.distributions import Categorical
 
 from countdown_env import CountdownEnv
-from rl_agent import generate_solvable_instances
 
 ActionKey = Tuple[int, str, int, int]          # (left, op, right, result) — 4-tuple chuẩn của build_steps
 State = Tuple[int, ...]
@@ -61,6 +58,7 @@ State = Tuple[int, ...]
 MAX_SLOTS = 8                                   # input.txt cho phép tối đa 8 số
 OP_LIST = ("+", "-", "*", "/")
 LOG_DENOM = math.log(10001.0)
+STANDARD_NUMBER_POOL = [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 25, 50, 75, 100]
 
 
 # ---------------------------------------------------------------------------
@@ -503,6 +501,45 @@ def calculate_grpo_loss(
 # 7. GRPO AGENT: train loop / evaluation / checkpoint / solve adapter
 # ---------------------------------------------------------------------------
 
+def generate_solvable_instances(
+    count: int,
+    rng: Optional[random.Random] = None,
+    min_numbers: int = 4,
+    max_numbers: int = 6,
+    target_low: int = 100,
+    target_high: int = 999,
+    max_intermediate: int = 10000,
+    max_attempts_factor: int = 500,
+    exclude: Optional[List[Tuple[List[int], int]]] = None,
+) -> List[Tuple[List[int], int]]:
+    """Sinh puzzle có nghiệm bằng cách áp dụng ngẫu nhiên các phép tính hợp lệ."""
+    rng = rng or random
+    seen = {(tuple(sorted(numbers)), target) for numbers, target in (exclude or [])}
+    instances: List[Tuple[List[int], int]] = []
+    max_attempts = max(count * max_attempts_factor, 1000)
+    helper = CountdownEnv([1, 2], 1)
+    attempts = 0
+    while len(instances) < count and attempts < max_attempts:
+        attempts += 1
+        number_count = rng.randint(min_numbers, max_numbers)
+        numbers = tuple(sorted(rng.choice(STANDARD_NUMBER_POOL) for _ in range(number_count)))
+        state = numbers
+        while len(state) > 1:
+            actions = [action for action in helper.get_valid_actions(state)
+                       if action[3] <= max_intermediate]
+            if not actions:
+                break
+            state = rng.choice(actions)[4]
+        else:
+            target = state[0]
+            if target_low <= target <= target_high:
+                key = (numbers, target)
+                if key not in seen:
+                    seen.add(key)
+                    instances.append((list(numbers), target))
+    return instances
+
+
 def make_data_splits(
     seed: Optional[int] = None,
     train_count: int = 60,
@@ -512,9 +549,8 @@ def make_data_splits(
     max_numbers: int = 6,
 ) -> Dict[str, List[Tuple[List[int], int]]]:
     """
-    Sinh puzzle CÓ NGHIỆM (dùng lại generate_solvable_instances của rl_agent) và
-    chia train / validation / test KHÔNG giao nhau — đánh giá không đo trên đúng
-    puzzle đã huấn luyện. Trả về dict {'train': [...], 'val': [...], 'test': [...]}.
+    Sinh puzzle có nghiệm và chia train / validation / test không giao nhau.
+    Trả về dict {'train': [...], 'val': [...], 'test': [...]}.
     """
     rng = random.Random(seed)
     train = generate_solvable_instances(train_count, rng=rng, min_numbers=min_numbers, max_numbers=max_numbers)
@@ -712,7 +748,7 @@ class GRPOAgent:
 
         Trả về (operations, stats) với operations là tuple 4-tuple đúng chuẩn
         (left, op, right, result) để build_steps/save_results dùng lại không đổi;
-        None nếu không có nghiệm được xác nhận (giống hợp đồng MCTS cũ).
+        None nếu không có nghiệm được xác nhận.
         """
         cfg = self.config
         trajectories: List[Trajectory] = []
@@ -770,7 +806,7 @@ class GRPOAgent:
     #       torch.load(weights_only=True) — an toàn, không thực thi pickle tuple
     #       object tùy ý (tránh rủi ro deserialization code-execution).
     #   meta.json : config, danh sách instance train, số cập nhật, lịch sử.
-    # Hoàn toàn TÁCH BIỆT với q_table.json của Q-Learning.
+    # Dữ liệu và tham số policy được đóng gói riêng trong checkpoint GRPO.
 
     def save_checkpoint(self, path) -> None:
         """Lưu checkpoint GRPO riêng ra thư mục (policy + reference + optimizer + meta)."""
@@ -833,7 +869,7 @@ def _group_config(cfg: GRPOConfig, group_size: int) -> GRPOConfig:
 
 
 # ---------------------------------------------------------------------------
-# 8. GIAO DIỆN TƯƠNG THÍCH solve_countdown_rl (adapter, không sửa rl_agent.py)
+# 8. ENTRY POINT GIẢI PUZZLE BẰNG GRPO
 # ---------------------------------------------------------------------------
 
 def solve_countdown_grpo(
@@ -846,8 +882,7 @@ def solve_countdown_grpo(
     **kwargs,
 ) -> Tuple[Optional[Tuple[ActionKey, ...]], Dict[str, Any]]:
     """
-    Hàm giao diện GRPO song song với solve_countdown_rl của rl_agent:
-    trả về (operations, stats) với operations là tuple 4-tuple chuẩn → build_steps
+    Trả về (operations, stats) với operations là tuple 4-tuple chuẩn → build_steps
     / save_results / GUI của main.py dùng lại tự do, kiểu dữ liệu không đổi.
     Nếu chưa truyền agent, nạp từ `checkpoint` (mặc định grpo_checkpoint.pt).
     """
@@ -856,7 +891,7 @@ def solve_countdown_grpo(
         if not Path(path).exists():
             raise FileNotFoundError(
                 f"Không tìm thấy checkpoint GRPO tại {path}. "
-                "Hãy chạy: python main.py --algo grpo --mode train trước."
+                "Hãy chạy: python main.py --mode train trước."
             )
         agent = GRPOAgent.load_checkpoint(path)
     agent.config.require_use_all = require_use_all
