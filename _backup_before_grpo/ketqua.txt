@@ -1,0 +1,13 @@
+=== COUNTDOWN — REINFORCEMENT LEARNING ===
+Các số: 25 50 3 6 7 8
+Target: 952
+Thuật toán: MCTS-RL (Monte Carlo Tree Search + PUCT)
+Số lượt mô phỏng (Simulations): 406
+Root Visits: 406 | Root Q-Value: -25.82
+Lời giải: (((3 + 7) - 8) + ((25 - 6) * 50)) = 952
+Bước 1: 3 + 7 = 10
+Bước 2: 25 − 6 = 19
+Bước 3: 10 − 8 = 2
+Bước 4: 19 × 50 = 950
+Bước 5: 2 + 950 = 952
+Thời gian tìm kiếm: 33.263 ms

@@ -1,4 +1,5 @@
 import argparse
+import random
 import re
 import sys
 import time
@@ -18,15 +19,18 @@ from matplotlib.patches import FancyBboxPatch
 from matplotlib.widgets import Button
 
 from countdown_env import CountdownEnv
-from rl_agent import solve_countdown_rl
+from rl_agent import QLearningAgent, generate_solvable_instances, solve_countdown_rl
 from tree_visualizer import SearchTreeRecorder
 
 
 INPUT_FILE = Path(__file__).with_name("input.txt")
 OUTPUT_FILE = Path(__file__).with_name("ketqua.txt")
+Q_TABLE_FILE = Path(__file__).with_name("q_table.json")
+GRPO_CHECKPOINT_FILE = Path(__file__).with_name("grpo_checkpoint")
 TREE_DOT_FILE = Path(__file__).with_name("tree.dot")
 TREE_PNG_FILE = Path(__file__).with_name("tree.png")
 OPERATOR_SYMBOLS = {"+": "+", "-": "−", "*": "×", "/": "÷"}
+ALGO_DISPLAY_NAMES = {"mcts": "MCTS", "qlearning": "Q-Learning", "grpo": "GRPO"}
 
 
 def read_problem(path):
@@ -45,12 +49,23 @@ def read_problem(path):
     return numbers, target
 
 
-def countdown_rl(numbers, target, recorder=None, algorithm="mcts", require_use_all=True):
+def countdown_rl(numbers, target, recorder=None, algorithm="mcts", require_use_all=True, checkpoint=None):
     """
     Giải bài toán Countdown bằng thuật toán Học tăng cường (Reinforcement Learning).
-    - algorithm: 'mcts' (Monte Carlo Tree Search + UCB1) hoặc 'qlearning' (Q-Learning TD).
+    - algorithm: 'mcts' (MCTS + PUCT, mặc định), 'qlearning' (Q-Learning TD)
+      hoặc 'grpo' (Group Relative Policy Optimization — cần checkpoint đã train).
     - require_use_all: bắt buộc dùng tất cả các số ban đầu (đúng luật Countdown chuẩn).
+    - checkpoint: đường dẫn thư mục checkpoint GRPO (chỉ dùng cho algorithm='grpo').
     """
+    if algorithm == "grpo":
+        from grpo_agent import solve_countdown_grpo
+        return solve_countdown_grpo(
+            numbers=numbers,
+            target=target,
+            recorder=recorder,
+            require_use_all=require_use_all,
+            checkpoint=str(checkpoint) if checkpoint else None,
+        )
     return solve_countdown_rl(
         numbers=numbers,
         target=target,
@@ -120,6 +135,290 @@ def save_results(numbers, target, steps, expression, elapsed, stats=None):
                     f"{step['right']} = {step['result']}\n"
                 )
         output.write(f"Thời gian tìm kiếm: {elapsed * 1000:.3f} ms\n")
+
+
+def save_experiment_report(lines, title="=== COUNTDOWN — Q-LEARNING THÍ NGHIỆM RL ==="):
+    """Lưu báo cáo thí nghiệm RL (train/eval) vào ketqua.txt."""
+    with OUTPUT_FILE.open("w", encoding="utf-8") as output:
+        output.write(title + "\n")
+        for line in lines:
+            output.write(line + "\n")
+
+
+def run_train(args):
+    """Chế độ train: sinh nhiều puzzle có nghiệm, huấn luyện Q-Learning đa instance,
+    rồi lưu Q-table ra file JSON để đánh giá tổng quát hóa ở chế độ eval."""
+    qfile = Path(args.qfile)
+    rng = random.Random(args.seed)
+
+    print("=" * 60)
+    print("   Q-LEARNING — HUẤN LUYỆN ĐA INSTANCE")
+    print("=" * 60)
+    print(f"Đang sinh {args.train_instances} bài toán đảm bảo có nghiệm (dùng hết số)...")
+    instances = generate_solvable_instances(args.train_instances, rng=rng)
+    print(f"Đã sinh {len(instances)} instance, mỗi instance {args.episodes_per_instance} episodes.")
+
+    # Nạp Q-table cũ (nếu có) để huấn luyện tăng dần qua nhiều lần chạy.
+    agent = QLearningAgent(require_use_all=True, q_table_path=str(qfile))
+    if agent.Q:
+        print(f"Đã nạp Q-table cũ: {len(agent.Q)} mục từ {qfile}")
+
+    start_time = time.perf_counter()
+    stats = agent.train_batch(instances, episodes_per_instance=args.episodes_per_instance)
+    elapsed = time.perf_counter() - start_time
+    agent.save_q_table(qfile, instances=instances)
+
+    lines = [
+        "Chế độ: train (Q-Learning đa instance, trạng thái mang theo Target)",
+        f"Số instance huấn luyện: {stats['instances']}",
+        f"Episodes mỗi instance: {stats['episodes_per_instance']}",
+        f"Tổng số episodes: {stats['episodes_trained']}",
+        f"Epsilon cuối chuỗi train: {stats['final_epsilon']:.4f}",
+        f"Số instance từng được giải khi train (epsilon-greedy): "
+        f"{stats['solved_instances']}/{stats['instances']}",
+        f"Số mục Q-table: {stats['q_table_entries']}",
+        f"Thời gian huấn luyện: {elapsed * 1000:.1f} ms",
+        f"Đã lưu Q-table vào: {qfile}",
+        "",
+        f"Đánh giá tổng quát hóa bằng: python main.py --mode eval --qfile {qfile}",
+    ]
+    print("\n--- KẾT QUẢ HUẤN LUYỆN ---")
+    for line in lines:
+        print(line)
+    save_experiment_report(lines)
+    print(f"\nĐã lưu báo cáo vào: {OUTPUT_FILE}")
+
+
+def run_eval(args):
+    """Chế độ eval: nạp Q-table đã lưu và đánh giá policy greedy thuần trên
+    các puzzle held-out (không nằm trong tập train) để đo khả năng tổng quát hóa."""
+    qfile = Path(args.qfile)
+    if not qfile.exists():
+        print(f"Không tìm thấy Q-table tại {qfile}.")
+        print("Hãy chạy huấn luyện trước: python main.py --mode train")
+        sys.exit(1)
+    agent = QLearningAgent(require_use_all=True, q_table_path=str(qfile))
+    rng = random.Random(args.eval_seed)
+
+    print("=" * 60)
+    print("   Q-LEARNING — ĐÁNH GIÁ TỔNG QUÁT HÓA (HELD-OUT, GREEDY THUẦN)")
+    print("=" * 60)
+    held_out = generate_solvable_instances(
+        args.eval_instances, rng=rng, exclude=agent.train_instances
+    )
+    print(f"Q-table: {qfile} ({len(agent.Q)} mục, {len(agent.train_instances)} instance train).")
+    print(f"Đang đánh giá greedy thuần trên {len(held_out)} puzzle held-out...")
+
+    start_time = time.perf_counter()
+    results = []
+    for numbers, target in held_out:
+        success, steps, final = agent.greedy_success(numbers, target, rng=rng)
+        results.append((numbers, target, success, steps, final))
+    elapsed = time.perf_counter() - start_time
+
+    solved = sum(1 for r in results if r[2])
+    lines = [
+        "Chế độ: eval (chính sách greedy THUẦN trên Q-table đã lưu, không heuristic)",
+        f"Nguồn Q-table: {qfile} ({len(agent.Q)} mục)",
+        f"Số puzzle held-out: {len(results)}",
+        f"Tỷ lệ tổng quát hóa (success rate): {solved}/{len(results)} = "
+        f"{solved / len(results):.1%}" if results else "Tỷ lệ tổng quát hóa: N/A",
+        f"Thời gian đánh giá: {elapsed * 1000:.1f} ms",
+        "",
+        "Chi tiết từng puzzle held-out:",
+    ]
+    for index, (numbers, target, success, steps, final) in enumerate(results, start=1):
+        if success:
+            status = f"ĐẠT (bước {steps})"
+        elif final is None:
+            status = "KHÔNG (tắc nghẽn, hết hành động hợp lệ)"
+        else:
+            status = f"KHÔNG (còn {final}, lệch {abs(final - target)})"
+        lines.append(f"{index}. {' '.join(map(str, numbers))} | Target {target} -> {status}")
+
+    # Đánh giá thêm trên puzzle hiện tại trong input.txt (nếu đọc được).
+    try:
+        numbers, target = read_problem(INPUT_FILE)
+        success, steps, final = agent.greedy_success(numbers, target, rng=rng)
+        status = f"ĐẠT (bước {steps})" if success else (
+            f"KHÔNG (còn {final}, lệch {abs((final or target) - target)})" if final is not None
+            else "KHÔNG (tắc nghẽn)"
+        )
+        lines += [
+            "",
+            f"Puzzle trong input.txt: {' '.join(map(str, numbers))} | Target {target} -> {status}",
+            "(Lưu ý: để giải input.txt đúng luật dự án, dùng chế độ solve: "
+            "python main.py --algo qlearning)",
+        ]
+    except (OSError, ValueError):
+        pass
+
+    print()
+    for line in lines:
+        print(line)
+    save_experiment_report(lines)
+    print(f"\nĐã lưu báo cáo vào: {OUTPUT_FILE}")
+
+
+def build_grpo_config(args):
+    """ Ánh xạ tham số argparse -> GRPOConfig (module grpo_agent)."""
+    from grpo_agent import GRPOConfig
+    return GRPOConfig(
+        learning_rate=args.lr,
+        batch_size=args.grpo_batch_size,
+        group_size=args.group_size,
+        num_epochs=args.epochs,
+        inner_epochs=args.inner_epochs,
+        max_steps_per_episode=args.max_steps,
+        clip_epsilon=args.clip_epsilon,
+        kl_coefficient=args.kl_coeff,
+        seed=args.seed,
+        checkpoint_interval=args.ckpt_interval,
+        evaluation_interval=args.eval_interval,
+        device=args.device,
+        max_gradient_norm=args.max_grad_norm,
+        require_use_all=not args.allow_partial,
+    )
+
+
+def run_grpo_train(args):
+    """Chế độ train (GRPO): sinh puzzle có nghiệm, chia train/val/test không giao
+    nhau, huấn luyện GRPO (group + verifier reward + clipped surrogate) và lưu
+    checkpoint RIÊNG vào thư mục grpo_checkpoint/ (không ghi đè q_table.json)."""
+    from grpo_agent import GRPOAgent, make_data_splits
+
+    ckpt = Path(args.grpo_file)
+    config = build_grpo_config(args)
+
+    print("=" * 60)
+    print("   GRPO — HUẤN LUYỆN GROUP RELATIVE POLICY OPTIMIZATION")
+    print("=" * 60)
+    print(f"Đang sinh puzzle có nghiệm (train={args.train_instances}, "
+          f"val={max(5, args.train_instances // 4)}, test={args.eval_instances})...")
+    splits = make_data_splits(
+        seed=args.seed,
+        train_count=args.train_instances,
+        val_count=max(5, args.train_instances // 4),
+        test_count=args.eval_instances,
+    )
+    print(f"Splits: {len(splits['train'])} train / {len(splits['val'])} val / "
+          f"{len(splits['test'])} test (không giao nhau).")
+    print(f"Config: lr={config.learning_rate} group_size={config.group_size} "
+          f"batch={config.batch_size} epochs={config.num_epochs} clip={config.clip_epsilon} "
+          f"kl={config.kl_coefficient} device={config.device} seed={config.seed}")
+
+    # Nạp checkpoint cũ (nếu có) để huấn luyện tăng dần — giống hành vi train Q-table.
+    if (ckpt / "policy.pt").exists():
+        agent = GRPOAgent.load_checkpoint(ckpt)
+        print(f"Đã nạp checkpoint GRPO cũ: {ckpt} ({agent.policy_updates} cập nhật policy).")
+        agent.config = config
+        agent.optimizer = __import__("torch").optim.Adam(agent.policy.parameters(), lr=config.learning_rate)
+    else:
+        agent = GRPOAgent(config)
+    agent.data_splits = splits
+
+    start_time = time.perf_counter()
+    result = agent.train_grpo(splits["train"], val_instances=splits["val"],
+                              checkpoint_path=str(ckpt))
+    elapsed = time.perf_counter() - start_time
+
+    last = result["epochs"][-1] if result["epochs"] else {}
+    lines = [
+        "Chế độ: train (GRPO — Group Relative Policy Optimization)",
+        f"Số puzzle train/val/test: {len(splits['train'])}/{len(splits['val'])}/{len(splits['test'])}",
+        f"Group size G: {config.group_size} | Batch puzzle: {config.batch_size} | Epochs: {config.num_epochs}",
+        f"Clip epsilon: {config.clip_epsilon} | KL beta: {config.kl_coefficient} | LR: {config.learning_rate}",
+        f"Tổng số lần cập nhật policy (optimizer.step): {result['policy_updates']}",
+        f"Epoch cuối: mean_reward={last.get('mean_reward', 0):+.3f} "
+        f"train_solve={last.get('train_group_solve_rate', 0):.0%} "
+        f"loss={last.get('loss', 0):+.4f} entropy={last.get('entropy', 0):.2f} "
+        f"dup={last.get('duplicate_rate', 0):.0%} "
+        f"val_exact={last.get('val_exact_solve_rate', float('nan')):.0%}",
+        f"Thời gian huấn luyện: {elapsed:.1f} s",
+        f"Đã lưu checkpoint GRPO vào: {ckpt}/ (policy.pt, reference.pt, optimizer.pt, meta.json)",
+        "",
+        f"Đánh giá held-out bằng: python main.py --algo grpo --mode eval --grpo-file {ckpt}",
+    ]
+    print("\n--- KẾT QUẢ HUẤN LUYỆN GRPO ---")
+    for line in lines:
+        print(line)
+    save_experiment_report(lines, title="=== COUNTDOWN — GRPO THÍ NGHIỆM RL ===")
+    print(f"\nĐã lưu báo cáo vào: {OUTPUT_FILE}")
+
+
+def run_grpo_eval(args):
+    """Chế độ eval (GRPO): nạp checkpoint, đánh giá policy THUẦN (greedy argmax,
+    không heuristic) trên tập test held-out đã lưu trong checkpoint (hoặc sinh mới
+    loại trừ tập train), kèm phương án best-of-N sampling để so sánh."""
+    from grpo_agent import GRPOAgent
+    from rl_agent import generate_solvable_instances
+
+    ckpt = Path(args.grpo_file)
+    if not (ckpt / "policy.pt").exists():
+        print(f"Không tìm thấy checkpoint GRPO tại {ckpt}.")
+        print("Hãy chạy huấn luyện trước: python main.py --algo grpo --mode train")
+        sys.exit(1)
+    agent = GRPOAgent.load_checkpoint(ckpt)
+
+    test_instances = agent.data_splits.get("test") or []
+    if not test_instances:
+        rng = random.Random(args.eval_seed)
+        test_instances = generate_solvable_instances(
+            args.eval_instances, rng=rng, exclude=agent.train_instances
+        )
+
+    print("=" * 60)
+    print("   GRPO — ĐÁNH GIÁ TỔNG QUÁT HÓA (HELD-OUT TEST, POLICY THUẦN)")
+    print("=" * 60)
+    print(f"Checkpoint: {ckpt} ({agent.policy_updates} cập nhật policy, "
+          f"{len(agent.train_instances)} puzzle train).")
+    print(f"Đang đánh giá greedy thuần trên {len(test_instances)} puzzle held-out...")
+
+    start_time = time.perf_counter()
+    greedy = agent.evaluate_grpo(test_instances, greedy=True, best_of_n=1)
+    sampled = agent.evaluate_grpo(test_instances, greedy=False, best_of_n=args.best_of_n)
+    elapsed = time.perf_counter() - start_time
+
+    lines = [
+        "Chế độ: eval (GRPO — policy thuần từ checkpoint, nghiệm đã qua verifier độc lập)",
+        f"Nguồn checkpoint: {ckpt} ({agent.policy_updates} lần cập nhật tham số)",
+        f"Số puzzle test held-out: {greedy['instances']} (không trùng tập train)",
+        "",
+        "[1] Policy greedy THUẦN (argmax π_θ, không sampling, không heuristic):",
+        f"    Exact solve rate:     {greedy['exact_solve_rate']:.1%}",
+        f"    Valid solution rate:  {greedy['valid_solution_rate']:.1%}",
+        f"    Mean abs error:       {greedy['mean_abs_error']:.1f}",
+        f"    Mean traj length:     {greedy['mean_traj_length']:.2f}",
+        "",
+        f"[2] Best-of-{args.best_of_n} sampling (lấy mẫu N nghiệm, chọn nghiệm tốt nhất đã verifier):",
+        f"    Exact solve rate:     {sampled['exact_solve_rate']:.1%}",
+        f"    Valid solution rate:  {sampled['valid_solution_rate']:.1%}",
+        f"    Mean abs error:       {sampled['mean_abs_error']:.1f}",
+        f"    Mean traj length:     {sampled['mean_traj_length']:.2f}",
+        "",
+        f"Thời gian đánh giá: {elapsed:.1f} s",
+    ]
+
+    # Đánh giá thêm trên puzzle hiện tại trong input.txt (nếu đọc được).
+    try:
+        numbers, target = read_problem(INPUT_FILE)
+        ops, stats = countdown_rl(numbers=numbers, target=target, algorithm="grpo",
+                                  require_use_all=not args.allow_partial,
+                                  checkpoint=str(ckpt))
+        status = "ĐẠT (đã verifier xác nhận)" if ops is not None else "KHÔNG (không có nghiệm được xác nhận)"
+        lines += [
+            "",
+            f"Puzzle trong input.txt: {' '.join(map(str, numbers))} | Target {target} -> {status}",
+            "(Lưu ý: để giải input.txt đúng luật dự án, dùng: python main.py --algo grpo --mode solve)",
+        ]
+    except (OSError, ValueError):
+        pass
+
+    print()
+    for line in lines:
+        print(line)
+    save_experiment_report(lines, title="=== COUNTDOWN — GRPO THÍ NGHIỆM RL ===")
+    print(f"\nĐã lưu báo cáo vào: {OUTPUT_FILE}")
 
 
 def show_simulation(numbers, target, steps, expression):
@@ -232,22 +531,113 @@ def show_simulation(numbers, target, steps, expression):
 def main():
     parser = argparse.ArgumentParser(description="Countdown Solver sử dụng Học tăng cường (Reinforcement Learning).")
     parser.add_argument(
+        "--mode",
+        choices=["solve", "train", "eval"],
+        default="solve",
+        help="solve: giải bài toán trong input.txt (mặc định); train: huấn luyện thuật toán "
+             "được chọn (--algo) trên nhiều instance và lưu bảng/checkpoint; eval: đánh giá "
+             "tổng quát hóa trên puzzle held-out.",
+    )
+    parser.add_argument(
         "--algo",
-        choices=["mcts", "qlearning"],
+        choices=["mcts", "qlearning", "grpo"],
         default="mcts",
-        help="Thuật toán RL sử dụng: 'mcts' (MCTS + UCB1, mặc định) hoặc 'qlearning' (Q-Learning TD).",
+        help="Thuật toán RL: 'mcts' (MCTS + PUCT, mặc định), 'qlearning' (Q-Learning TD), "
+             "'grpo' (Group Relative Policy Optimization — cần train trước khi solve/eval).",
+    )
+    parser.add_argument(
+        "--qfile",
+        default=str(Q_TABLE_FILE),
+        help="Đường dẫn file Q-table JSON dùng cho chế độ train/eval của Q-Learning.",
+    )
+    parser.add_argument(
+        "--grpo-file",
+        default=str(GRPO_CHECKPOINT_FILE),
+        help="Thư mục checkpoint GRPO (policy.pt/reference.pt/optimizer.pt/meta.json) "
+             "cho --algo grpo. Mặc định: grpo_checkpoint/ (không ghi đè q_table.json).",
+    )
+    parser.add_argument(
+        "--train-instances",
+        type=int,
+        default=100,
+        help="Số instance huấn luyện khi --mode train (mặc định 100).",
+    )
+    parser.add_argument(
+        "--episodes-per-instance",
+        type=int,
+        default=150,
+        help="Số episodes mỗi instance khi --mode train (mặc định 150).",
+    )
+    parser.add_argument(
+        "--eval-instances",
+        type=int,
+        default=50,
+        help="Số puzzle held-out khi --mode eval (mặc định 50).",
+    )
+    parser.add_argument(
+        "--seed",
+        type=int,
+        default=None,
+        help="Seed sinh tập instance huấn luyện (--mode train) và torch/random cho GRPO.",
+    )
+    parser.add_argument(
+        "--eval-seed",
+        type=int,
+        default=None,
+        help="Seed sinh tập puzzle held-out (--mode eval).",
     )
     parser.add_argument(
         "--no-gui",
         action="store_true",
-        help="Chạy không mở cửa sổ giao diện Matplotlib (thích hợp chạy script tự động/headless).",
+        help="Chạy không mở cửa sổ giao diện Matplotlib (chỉ áp dụng chế độ solve).",
     )
     parser.add_argument(
         "--allow-partial",
         action="store_true",
         help="Cho phép dừng ngay khi đạt target mà không cần dùng hết toàn bộ số đầu vào.",
     )
+    # -------------------- Tham số GRPO (--algo grpo) --------------------
+    grpo_group = parser.add_argument_group(
+        "GRPO", "Tham số huấn luyện/đánh giá GRPO; bỏ qua với --algo mcts/qlearning."
+    )
+    grpo_group.add_argument("--lr", type=float, default=3e-3, help="Learning rate GRPO (mặc định 3e-3).")
+    grpo_group.add_argument("--grpo-batch-size", type=int, default=4,
+                            help="Số puzzle mỗi lần sinh group + cập nhật GRPO (mặc định 4).")
+    grpo_group.add_argument("--group-size", type=int, default=8,
+                            help="G — số trajectory lấy mẫu cho MỖI puzzle trong một group (mặc định 8).")
+    grpo_group.add_argument("--epochs", type=int, default=10,
+                            help="Số epoch huấn luyện GRPO (--mode train, mặc định 10).")
+    grpo_group.add_argument("--inner-epochs", type=int, default=2,
+                            help="Số lần tái dùng batch đã sinh cho gradient (PPO-style, mặc định 2).")
+    grpo_group.add_argument("--max-steps", type=int, default=16,
+                            help="Trần số bước hành động mỗi trajectory GRPO (mặc định 16).")
+    grpo_group.add_argument("--clip-epsilon", type=float, default=0.2,
+                            help="ε clipped surrogate objective GRPO (mặc định 0.2).")
+    grpo_group.add_argument("--kl-coeff", type=float, default=0.0,
+                            help="β hệ số KL(π_θ||π_ref); 0 = tắt reference policy (mặc định 0.0).")
+    grpo_group.add_argument("--max-grad-norm", type=float, default=1.0,
+                            help="Clip tổng norm gradient (mặc định 1.0).")
+    grpo_group.add_argument("--device", default="cpu", help="Thiết bị torch cho GRPO (mặc định 'cpu').")
+    grpo_group.add_argument("--ckpt-interval", type=int, default=2,
+                            help="Lưu checkpoint GRPO mỗi N epoch (mặc định 2).")
+    grpo_group.add_argument("--eval-interval", type=int, default=2,
+                            help="Đánh giá tập validation mỗi N epoch (mặc định 2).")
+    grpo_group.add_argument("--best-of-n", type=int, default=16,
+                            help="Số nghiệm lấy mẫu best-of-N khi --algo grpo --mode eval (mặc định 16).")
     args = parser.parse_args()
+
+    if args.mode == "train":
+        if args.algo == "grpo":
+            run_grpo_train(args)
+        else:
+            run_train(args)
+        return
+    if args.mode == "eval":
+        if args.algo == "grpo":
+            run_grpo_eval(args)
+        else:
+            run_eval(args)
+        return
 
     try:
         numbers, target = read_problem(INPUT_FILE)
@@ -255,7 +645,7 @@ def main():
         print(f"Lỗi input: {error}")
         sys.exit(1)
 
-    algo_name = "MCTS" if args.algo == "mcts" else "Q-Learning"
+    algo_name = ALGO_DISPLAY_NAMES.get(args.algo, args.algo)
     tree_recorder = SearchTreeRecorder(target, algorithm=f"RL ({algo_name})")
 
     print("=" * 60)
@@ -267,15 +657,26 @@ def main():
     print("Đang chạy thuật toán Học tăng cường...")
 
     start_time = time.perf_counter()
-    operations, stats = countdown_rl(
-        numbers=numbers,
-        target=target,
-        recorder=tree_recorder,
-        algorithm=args.algo,
-        require_use_all=not args.allow_partial,
-    )
+    try:
+        operations, stats = countdown_rl(
+            numbers=numbers,
+            target=target,
+            recorder=tree_recorder,
+            algorithm=args.algo,
+            require_use_all=not args.allow_partial,
+            checkpoint=str(Path(args.grpo_file)) if args.algo == "grpo" else None,
+        )
+    except FileNotFoundError as error:
+        print(f"Lỗi: {error}")
+        sys.exit(1)
     elapsed = time.perf_counter() - start_time
     steps, expression = build_steps(numbers, operations) if operations is not None else ([], None)
+    # Verifier độc lập kiểm chứng lời giải trước khi công bố (mọi thuật toán).
+    if operations is not None:
+        from grpo_agent import verify_trajectory
+        if not verify_trajectory(numbers, target, operations, not args.allow_partial).success:
+            print("CẢNH BÁO: lời giải không vượt qua verifier độc lập — coi như không hợp lệ.")
+            operations, steps, expression = None, [], None
 
     dot_path = tree_recorder.write_dot(TREE_DOT_FILE)
     tree_recorder.render_png(dot_path, TREE_PNG_FILE)
@@ -286,6 +687,9 @@ def main():
         print(f"Số lượt mô phỏng (Simulations): {stats['simulations']}")
     if "episodes_trained" in stats:
         print(f"Số Episodes huấn luyện: {stats['episodes_trained']}")
+    if "trajectories_generated" in stats:
+        print(f"Số trajectory GRPO đã sinh (đã verifier): {stats['trajectories_generated']}")
+        print(f"Số lần cập nhật policy trong checkpoint: {stats.get('policy_updates_at_load', 0)}")
     if "root_visits" in stats:
         print(f"Root Visits: {stats['root_visits']} | Root Q-Value: {stats.get('root_q_value', 0):.2f}")
     print(f"Số node cây RL (depth 0-2): {len(tree_recorder.nodes)}")
