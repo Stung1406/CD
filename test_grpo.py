@@ -17,6 +17,7 @@ from pathlib import Path
 import torch
 
 from countdown_env import CountdownEnv
+from countdown_search import solve_countdown_exact
 from grpo_agent import (
     GRPOAgent,
     GRPOConfig,
@@ -127,6 +128,30 @@ class TestVerifier(unittest.TestCase):
         r_miss, _ = calculate_trajectory_reward([2, 3, 4, 5], 100, [(2, "+", 3, 5), (4, "*", 5, 20), (5, "+", 20, 25)], True)
         self.assertLess(r_miss, 0.0)
         self.assertGreater(r_miss, -1.0)
+
+
+class TestExactSearchBaseline(unittest.TestCase):
+    def test_solves_952_with_verified_legal_actions(self):
+        operations, stats = solve_countdown_exact(NUMBERS, TARGET, require_use_all=True)
+        self.assertIsNotNone(operations)
+        self.assertTrue(verify_trajectory(NUMBERS, TARGET, operations, True).success)
+        env = CountdownEnv(NUMBERS, TARGET)
+        state = env.reset()
+        for operation in operations:
+            action = next((a for a in env.get_valid_actions(state)
+                           if a[:4] == operation), None)
+            self.assertIsNotNone(action)
+            state = action[4]
+        self.assertEqual(state, (TARGET,))
+        self.assertEqual(stats["valid_solutions"], 1)
+        self.assertEqual(stats["exact_solutions"], 1)
+
+    def test_duplicate_input_numbers_and_partial_goal(self):
+        partial, _ = solve_countdown_exact([2, 2, 5], 4, require_use_all=False)
+        self.assertIsNotNone(partial)
+        self.assertTrue(verify_trajectory([2, 2, 5], 4, partial, False).success)
+        exact, _ = solve_countdown_exact([2, 2], 4, require_use_all=True)
+        self.assertEqual(exact, ((2, "+", 2, 4),))
 
 
 class TestPolicyNetwork(unittest.TestCase):

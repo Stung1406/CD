@@ -759,20 +759,39 @@ class GRPOAgent:
                                                 _group_config(cfg, fallback_group_size)))
         solved = [t for t in trajectories if t.success]
         best = solved[0] if solved else None
+        grpo_solved = best is not None
+        search_stats = {
+            "states_expanded": 0, "unique_states": 0, "duplicate_states": 0,
+            "valid_solutions": 0, "exact_solutions": 0,
+        }
+        solution_source = "GRPO" if best is not None else None
+        operations = tuple(best.actions) if best is not None else None
+        # Keep exact search as a separately reported verifier/baseline after the
+        # policy's own attempts; never attribute its result to GRPO.
+        if operations is None:
+            from countdown_search import solve_countdown_exact
+            operations, search_stats = solve_countdown_exact(
+                numbers, target, require_use_all=cfg.require_use_all
+            )
+            if operations is not None:
+                solution_source = "deterministic_search"
 
         if recorder is not None:
             self._record(trajectories[0] if best is None else best, numbers, target, recorder)
 
         stats = {
-            "algorithm": "GRPO (Group Relative Policy Optimization)",
+            "algorithm": "GRPO policy + deterministic search fallback",
             "trajectories_generated": len(trajectories),
-            "verified": bool(solved),
+            "grpo_verified": grpo_solved,
+            "verified": operations is not None,
+            "solution_source": solution_source,
             "policy_updates_at_load": self.policy_updates,
-            "solution_depth": len(best.actions) if best else 0,
+            "solution_depth": len(operations) if operations else 0,
+            **search_stats,
         }
-        if best is None:
+        if operations is None:
             return None, stats
-        return tuple(best.actions), stats
+        return operations, stats
 
     @staticmethod
     def _record(traj: Trajectory, numbers: Sequence[int], target: int, recorder) -> None:

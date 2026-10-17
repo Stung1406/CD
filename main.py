@@ -98,6 +98,11 @@ def save_results(numbers, target, steps, expression, elapsed, stats=None):
                 output.write(f"Số trajectory GRPO đã sinh: {stats['trajectories_generated']}\n")
             if "policy_updates_at_load" in stats:
                 output.write(f"Số lần cập nhật policy: {stats['policy_updates_at_load']}\n")
+            if "solution_source" in stats:
+                output.write(f"Nguồn nghiệm: {stats['solution_source'] or 'không có'}\n")
+            if "states_expanded" in stats:
+                output.write(f"State tìm kiếm mở rộng: {stats['states_expanded']}\n")
+                output.write(f"State trùng đã bỏ qua: {stats['duplicate_states']}\n")
         if expression is None:
             output.write("Không tìm thấy lời giải chính xác.\n")
         else:
@@ -260,7 +265,7 @@ def run_grpo_eval(args):
     # Đánh giá thêm trên puzzle hiện tại trong input.txt (nếu đọc được).
     try:
         numbers, target = read_problem(INPUT_FILE)
-        ops, _ = solve_countdown(
+        ops, puzzle_stats = solve_countdown(
             numbers=numbers,
             target=target,
             require_use_all=not args.allow_partial,
@@ -269,7 +274,8 @@ def run_grpo_eval(args):
         status = "ĐẠT (đã verifier xác nhận)" if ops is not None else "KHÔNG (không có nghiệm được xác nhận)"
         lines += [
             "",
-            f"Puzzle trong input.txt: {' '.join(map(str, numbers))} | Target {target} -> {status}",
+            f"Puzzle trong input.txt: {' '.join(map(str, numbers))} | Target {target} -> {status} "
+            f"[nguồn: {puzzle_stats.get('solution_source') or 'không có'}]",
             "(Lưu ý: để giải input.txt, dùng: python main.py --mode solve)",
         ]
     except (OSError, ValueError):
@@ -480,15 +486,15 @@ def main():
         print(f"Lỗi input: {error}")
         sys.exit(1)
 
-    tree_recorder = SearchTreeRecorder(target, algorithm="GRPO")
+    tree_recorder = SearchTreeRecorder(target, algorithm="GRPO sampled rollout")
 
     print("=" * 60)
-    print("   COUNTDOWN SOLVER — GRPO")
+    print("   COUNTDOWN SOLVER — GRPO + EXACT SEARCH FALLBACK")
     print("=" * 60)
     print(f"Các số ban đầu: {numbers}")
     print(f"Mục tiêu Target: {target}")
     print(f"Bắt buộc dùng hết số: {not args.allow_partial}")
-    print("Đang giải bằng policy GRPO...")
+    print("Đang thử policy GRPO; nếu chưa giải được sẽ chạy exact-search baseline...")
 
     start_time = time.perf_counter()
     try:
@@ -514,11 +520,18 @@ def main():
     dot_path = tree_recorder.write_dot(TREE_DOT_FILE)
     tree_recorder.render_png(dot_path, TREE_PNG_FILE)
 
-    print("\n--- KẾT QUẢ GRPO ---")
+    print("\n--- KẾT QUẢ SOLVER ---")
     print(f"Thuật toán: {stats.get('algorithm', 'GRPO')}")
+    print(f"Nguồn lời giải: {stats.get('solution_source') or 'không tìm thấy'}")
+    print(f"GRPO tự giải được: {'có' if stats.get('grpo_verified') else 'không'}")
     if "trajectories_generated" in stats:
         print(f"Số trajectory GRPO đã sinh: {stats['trajectories_generated']}")
         print(f"Số lần cập nhật policy trong checkpoint: {stats.get('policy_updates_at_load', 0)}")
+    if "states_expanded" in stats:
+        print(f"State exact search đã mở rộng: {stats['states_expanded']}")
+        print(f"Node trạng thái duy nhất: {stats['unique_states']}")
+        print(f"State trùng đã bỏ qua: {stats['duplicate_states']}")
+        print(f"Lời giải hợp lệ/chính xác từ search: {stats['valid_solutions']}/{stats['exact_solutions']}")
     print(f"Số node cây GRPO (depth 0-2): {len(tree_recorder.nodes)}")
     print(f"Số cạnh cây GRPO (depth 0-2): {len(tree_recorder.edges)}")
     print(f"Thời gian tìm kiếm: {elapsed * 1000:.3f} ms")

@@ -1,10 +1,10 @@
 digraph CountdownRL {
-    graph [rankdir="TB", ordering="out", labelloc="t", label="Countdown GRPO | Target: 952 | Depth: 0..2"];
+    graph [rankdir="TB", ordering="out", labelloc="t", label="Countdown GRPO sampled rollout | Target: 952 | Depth: 0..2"];
     node [shape="box", style="rounded,filled", fontname="Arial"];
     edge [fontname="Arial"];
-    n0 [label="[3, 6, 7, 8, 25, 50]\ndepth=0\nN=1 | Q=-0.11\nFAILED", fillcolor="#f8dddd"];
-    n1 [label="[3, 6, 7, 25, 400]\ndepth=1\nN=1 | Q=-5.29\nSEARCHING", fillcolor="#fff1c2"];
-    n2 [label="[6, 7, 25, 1200]\ndepth=2\nN=1 | Q=-5.29\nSEARCHING", fillcolor="#fff1c2"];
+    n0 [label="[3, 6, 7, 8, 25, 50]\ndepth=0\nN=1 | Q=-0.27\nFAILED", fillcolor="#f8dddd"];
+    n1 [label="[3, 6, 7, 25, 400]\ndepth=1\nN=1 | Q=-11.43\nSEARCHING", fillcolor="#fff1c2"];
+    n2 [label="[3, 6, 7, 425]\ndepth=2\nN=1 | Q=-11.43\nSEARCHING", fillcolor="#fff1c2"];
     n0 -> n1 [label="8 * 50 = 400\nSEARCHING", color="#bd4545"];
-    n1 -> n2 [label="3 * 400 = 1200\nSEARCHING", color="#bd4545"];
+    n1 -> n2 [label="25 + 400 = 425\nSEARCHING", color="#bd4545"];
 }

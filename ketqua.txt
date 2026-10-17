@@ -1,8 +1,21 @@
-=== COUNTDOWN — GRPO ===
-Các số: 25 50 3 6 7 8
-Target: 952
-Thuật toán: GRPO (Group Relative Policy Optimization)
-Số trajectory GRPO đã sinh: 33
-Số lần cập nhật policy: 1912
-Không tìm thấy lời giải chính xác.
-Thời gian tìm kiếm: 2903.304 ms
+=== COUNTDOWN — GRPO THÍ NGHIỆM RL ===
+Chế độ: eval (GRPO — policy thuần từ checkpoint, nghiệm đã qua verifier độc lập)
+Nguồn checkpoint: grpo_checkpoint_new (1650 lần cập nhật tham số)
+Số puzzle test held-out: 50 (không trùng tập train)
+
+[1] Policy greedy THUẦN (argmax π_θ, không sampling, không heuristic):
+    Exact solve rate:     16.0%
+    Valid solution rate:  100.0%
+    Mean abs error:       30.6
+    Mean traj length:     4.12
+
+[2] Best-of-16 sampling (lấy mẫu N nghiệm, chọn nghiệm tốt nhất đã verifier):
+    Exact solve rate:     16.0%
+    Valid solution rate:  100.0%
+    Mean abs error:       29.5
+    Mean traj length:     4.12
+
+Thời gian đánh giá: 2.7 s
+
+Puzzle trong input.txt: 25 50 3 6 7 8 | Target 952 -> ĐẠT (đã verifier xác nhận) [nguồn: deterministic_search]
+(Lưu ý: để giải input.txt, dùng: python main.py --mode solve)
